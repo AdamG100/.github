@@ -1,0 +1,145 @@
+name: Dependency updates
+
+# The rules for merging Dependabot's updates, kept here once for every repository.
+# Each repository calls this from its own .github/workflows/dependency-updates.yml
+# when its checks finish on a pull request, and every two days on a schedule.
+#
+# Dependabot looks for newer packages every two days (each repository's
+# .github/dependabot.yml) and gathers them into a pull request per group:
+# minor and patch updates (*-updates), major updates (*-major), and security
+# fixes (*-security). Once all the repository's checks have passed on one:
+#
+#   security fixes    merged straight away
+#   other updates     merged once the pull request holds at least MIN_UPDATES
+#                     packages, or one of them has been out MAX_WAIT_DAYS days.
+#                     Until then it stays open and Dependabot adds to it.
+#
+# A pull request whose checks failed is never merged: it stays open for a person.
+# Nothing from a pull request is checked out or run here.
+
+on:
+  workflow_call:
+    inputs:
+      check-workflows:
+        description: Workflow files that must all have passed on the pull request, space separated
+        type: string
+        required: true
+      deploy-workflow:
+        description: Workflow started on the default branch after a merge, since a merge made with this token starts none
+        type: string
+        default: ""
+      deploy-args:
+        description: Extra arguments for `gh workflow run`, such as -f force=false
+        type: string
+        default: ""
+
+env:
+  # The settings for every repository.
+  MIN_UPDATES: 3
+  MAX_WAIT_DAYS: 14
+
+jobs:
+  merge:
+    name: Merge the updates that are ready
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       startsWith(github.event.workflow_run.head_branch, 'dependabot/'))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: dependency-updates-${{ github.repository }}
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+
+    steps:
+      - name: Merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CHECK_WORKFLOWS: ${{ inputs.check-workflows }}
+          DEPLOY_WORKFLOW: ${{ inputs.deploy-workflow }}
+          DEPLOY_ARGS: ${{ inputs.deploy-args }}
+        run: |
+          set -uo pipefail
+
+          # Package updates only. Dependabot's other pull requests (Docker base
+          # images, GitHub Actions) are left to whatever each repository does with them.
+          packages='^dependabot/(npm_and_yarn|pip|uv|poetry)/'
+
+          passed() {
+            [ "$(gh run list --workflow "$1" --commit "$2" --event pull_request --limit 1 \
+              --json conclusion --jq '.[0].conclusion // ""')" = success ]
+          }
+
+          # When it was published, in seconds, for a package and version.
+          published() {
+            local at=
+            case "$ecosystem" in
+              npm_and_yarn) at=$(npm view "$1" time --json 2>/dev/null | jq -r --arg v "$2" '.[$v] // empty') ;;
+              *) at=$(curl -fsS "https://pypi.org/pypi/$1/$2/json" 2>/dev/null | jq -r '[.urls[].upload_time_iso_8601] | min // empty') ;;
+            esac
+            [ -n "$at" ] && date -d "$at" +%s
+          }
+
+          prs=$(gh pr list --state open --limit 100 --json number,author,headRefName \
+            --jq '.[] | select(.author.login == "app/dependabot" or .author.login == "dependabot") | "\(.number) \(.headRefName)"' \
+            | grep -E " $packages" || true)
+          if [ -n "$BRANCH" ]; then
+            prs=$(awk -v b="$BRANCH" '$2 == b' <<< "$prs")
+          fi
+
+          merged=false
+          now=$(date +%s)
+          while read -r pr branch; do
+            [ -n "$pr" ] || continue
+            ecosystem=$(cut -d/ -f2 <<< "$branch")
+            info=$(gh pr view "$pr" --json headRefOid,title,baseRefName)
+            sha=$(jq -r .headRefOid <<< "$info")
+            title=$(jq -r .title <<< "$info")
+            [ "$(jq -r .baseRefName <<< "$info")" = "$DEFAULT_BRANCH" ] || continue
+
+            for workflow in $CHECK_WORKFLOWS; do
+              if ! passed "$workflow" "$sha"; then
+                echo "#$pr waits: $workflow has not passed on ${sha::7}."
+                continue 2
+              fi
+            done
+
+            if grep -qE -- '-(updates|major) group' <<< "$title"; then
+              # The packages and versions, from Dependabot's commit message.
+              message=$(gh api "repos/$GH_REPO/commits/$sha" --jq .commit.message)
+              updates=$(awk '/^- dependency-name: /{n=$3} /^  dependency-version: /{print n, $2}' <<< "$message")
+              count=$(grep -c . <<< "$updates" || true)
+
+              oldest=$now
+              while read -r name version; do
+                [ -n "$name" ] || continue
+                at=$(published "$name" "$version") || continue
+                [ "$at" -lt "$oldest" ] && oldest=$at
+              done <<< "$updates"
+              days=$(( (now - oldest) / 86400 ))
+
+              if [ "$count" -lt "$MIN_UPDATES" ] && [ "$days" -lt "$MAX_WAIT_DAYS" ]; then
+                echo "#$pr waits: $count update(s), the oldest out $days day(s). Merged at $MIN_UPDATES updates or $MAX_WAIT_DAYS days."
+                continue
+              fi
+              reason="$count update(s), the oldest out $days day(s)"
+            else
+              reason="a security fix"
+            fi
+
+            echo "Merging #$pr ($reason): $title"
+            if gh pr merge "$pr" --squash --delete-branch --match-head-commit "$sha"; then
+              merged=true
+            fi
+          done <<< "$prs"
+
+          if [ "$merged" = true ] && [ -n "$DEPLOY_WORKFLOW" ]; then
+            # shellcheck disable=SC2086
+            gh workflow run "$DEPLOY_WORKFLOW" --ref "$DEFAULT_BRANCH" $DEPLOY_ARGS
+          fi
