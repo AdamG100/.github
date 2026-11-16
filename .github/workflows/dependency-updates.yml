@@ -9,7 +9,9 @@ name: Dependency updates
 # minor and patch updates (*-updates), major updates (*-major), and security
 # fixes (*-security). Once all the repository's checks have passed on one:
 #
-#   security fixes    merged straight away
+#   security fixes    merged straight away: the *-security group, or a pull
+#                     request that moves a package off a version listed as
+#                     vulnerable in GitHub's advisory database
 #   other updates     merged once the pull request holds at least MIN_UPDATES
 #                     packages, or one of them has been out MAX_WAIT_DAYS days.
 #                     Until then it stays open and Dependabot adds to it.
@@ -69,11 +71,18 @@ jobs:
 
           # Package updates only. Dependabot's other pull requests (Docker base
           # images, GitHub Actions) are left to whatever each repository does with them.
-          packages='^dependabot/(npm_and_yarn|pip|uv|poetry)/'
+          packages='dependabot/(npm_and_yarn|pip|uv|poetry)/'
 
           passed() {
             [ "$(gh run list --workflow "$1" --commit "$2" --event pull_request --limit 1 \
               --json conclusion --jq '.[0].conclusion // ""')" = success ]
+          }
+
+          # Whether a package at a version has a known vulnerability.
+          vulnerable() {
+            local eco=npm
+            [ "$ecosystem" = npm_and_yarn ] || eco=pip
+            [ "$(gh api "/advisories?ecosystem=$eco&affects=$1@$2&per_page=1" --jq 'length' 2>/dev/null)" -gt 0 ] 2>/dev/null
           }
 
           # When it was published, in seconds, for a package and version.
@@ -110,7 +119,21 @@ jobs:
               fi
             done
 
-            if grep -qE -- '-(updates|major) group' <<< "$title"; then
+            # A pull request of its own, outside the groups, is a security fix if
+            # the version it moves away from is vulnerable.
+            security=false
+            if grep -qE -- '-security group' <<< "$title"; then
+              security=true
+            elif ! grep -qE -- ' group' <<< "$title" &&
+                 [[ $title =~ ^(Bump|Update)\ ([^ ]+)\ (requirement\ )?from\ ([^ ]+)\ to ]]; then
+              name=${BASH_REMATCH[2]}
+              version=$(sed -E 's/^[^0-9]*//' <<< "${BASH_REMATCH[4]}")
+              if vulnerable "$name" "$version"; then
+                security=true
+              fi
+            fi
+
+            if [ "$security" = false ]; then
               # The packages and versions, from Dependabot's commit message.
               message=$(gh api "repos/$GH_REPO/commits/$sha" --jq .commit.message)
               updates=$(awk '/^- dependency-name: /{n=$3} /^  dependency-version: /{print n, $2}' <<< "$message")
