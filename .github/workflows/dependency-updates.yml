@@ -1,22 +1,35 @@
 name: Dependency updates
 
-# The rules for merging Dependabot's updates, kept here once for every repository.
+# The rules for Dependabot's pull requests, kept here once for every repository.
 # Each repository calls this from its own .github/workflows/dependency-updates.yml
 # when its checks finish on a pull request, and every two days on a schedule.
 #
-# Dependabot looks for newer packages every two days (each repository's
-# .github/dependabot.yml) and gathers them into a pull request per group:
-# minor and patch updates (*-updates), major updates (*-major), and security
-# fixes (*-security). Once all the repository's checks have passed on one:
+# Dependabot looks for newer versions every two days (each repository's
+# .github/dependabot.yml). Minor and patch updates come gathered into one pull
+# request (*-updates), security fixes into another (*-security), and each major
+# update comes on its own. Every open Dependabot pull request ends up merged or
+# closed:
 #
-#   security fixes    merged straight away: the *-security group, or a pull
-#                     request that moves a package off a version listed as
+#   security fixes    merged once the checks pass: the *-security group, or a
+#                     pull request that moves a package off a version listed as
 #                     vulnerable in GitHub's advisory database
-#   other updates     merged once the pull request holds at least MIN_UPDATES
-#                     packages, or one of them has been out MAX_WAIT_DAYS days.
-#                     Until then it stays open and Dependabot adds to it.
+#   other updates     merged once the checks pass and the pull request holds at
+#                     least MIN_UPDATES packages, or one of them has been out
+#                     MAX_WAIT_DAYS days. Until then Dependabot adds to it.
+#   superseded        a pull request for one package that a group pull request
+#                     also updates is closed
+#   failed            a failed check is run again once, in case it was a fluke.
+#                     If it fails again, a pull request for one package is closed:
+#                     Dependabot skips that version and offers the next one. A
+#                     group or a security fix stays open for a person, since
+#                     closing a group only brings it back two days later.
+#   stuck             a pull request with no result from its checks, or a
+#                     conflict, for STALE_DAYS days is closed. Dependabot opens
+#                     a fresh one if the update is still needed.
 #
-# A pull request whose checks failed is never merged: it stays open for a person.
+# GitHub doesn't let a workflow's own token merge a change to a workflow, which
+# is what an update of a GitHub Action is. Those are merged with the merge-token
+# secret when there is one, and otherwise wait for a person.
 # Nothing from a pull request is checked out or run here.
 
 on:
@@ -34,20 +47,25 @@ on:
         description: Extra arguments for `gh workflow run`, such as -f force=false
         type: string
         default: ""
+    secrets:
+      merge-token:
+        description: A token allowed to change workflows (contents, pull requests and workflows), to merge updates of GitHub Actions
+        required: false
 
 env:
   # The settings for every repository.
   MIN_UPDATES: 3
   MAX_WAIT_DAYS: 14
+  STALE_DAYS: 3
 
 jobs:
   merge:
-    name: Merge the updates that are ready
+    name: Merge or close Dependabot's pull requests
     if: >-
       github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'pull_request' &&
-       startsWith(github.event.workflow_run.head_branch, 'dependabot/'))
+      (github.event.workflow_run.event == 'pull_request' &&
+       startsWith(github.event.workflow_run.head_branch, 'dependabot/') &&
+       contains(fromJSON('["success", "failure", "timed_out"]'), github.event.workflow_run.conclusion))
     runs-on: ubuntu-latest
     concurrency:
       group: dependency-updates-${{ github.repository }}
@@ -57,10 +75,11 @@ jobs:
       actions: write
 
     steps:
-      - name: Merge
+      - name: Merge or close
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          MERGE_TOKEN: ${{ secrets.merge-token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
           CHECK_WORKFLOWS: ${{ inputs.check-workflows }}
@@ -68,82 +87,169 @@ jobs:
           DEPLOY_ARGS: ${{ inputs.deploy-args }}
         run: |
           set -uo pipefail
+          now=$(date +%s)
 
-          # Package updates only. Dependabot's other pull requests (Docker base
-          # images, GitHub Actions) are left to whatever each repository does with them.
-          packages='dependabot/(npm_and_yarn|pip|uv|poetry)/'
+          # The state of a check workflow on a commit: passed, failed, pending or
+          # missing. A failure on the first attempt is run again and counts as pending.
+          check() {
+            local run
+            run=$(gh run list --workflow "$1" --commit "$2" --event pull_request --limit 1 \
+              --json databaseId,status,conclusion,attempt --jq '.[0] // empty')
+            if [ -z "$run" ]; then echo missing; return; fi
+            case "$(jq -r '.status' <<< "$run")/$(jq -r '.conclusion' <<< "$run")" in
+              completed/success) echo passed ;;
+              completed/failure | completed/timed_out | completed/cancelled | completed/startup_failure)
+                if [ "$(jq -r '.attempt' <<< "$run")" -lt 2 ] &&
+                   gh run rerun "$(jq -r '.databaseId' <<< "$run")" --failed >/dev/null 2>&1; then
+                  echo pending
+                else
+                  echo failed
+                fi ;;
+              completed/*) echo failed ;;
+              *) echo pending ;;
+            esac
+          }
 
-          passed() {
-            [ "$(gh run list --workflow "$1" --commit "$2" --event pull_request --limit 1 \
-              --json conclusion --jq '.[0].conclusion // ""')" = success ]
+          # The advisory database's name for an ecosystem, if it has one.
+          advisory_ecosystem() {
+            case "$1" in
+              npm_and_yarn) echo npm ;;
+              pip | uv | poetry) echo pip ;;
+              github_actions) echo actions ;;
+            esac
           }
 
           # Whether a package at a version has a known vulnerability.
           vulnerable() {
-            local eco=npm
-            [ "$ecosystem" = npm_and_yarn ] || eco=pip
-            [ "$(gh api "/advisories?ecosystem=$eco&affects=$1@$2&per_page=1" --jq 'length' 2>/dev/null)" -gt 0 ] 2>/dev/null
+            local eco
+            eco=$(advisory_ecosystem "$ecosystem")
+            [ -n "$eco" ] &&
+              [ "$(gh api "/advisories?ecosystem=$eco&affects=$1@$2&per_page=1" --jq 'length' 2>/dev/null)" -gt 0 ] 2>/dev/null
           }
 
-          # When it was published, in seconds, for a package and version.
+          # When a version of a package was published, in seconds.
           published() {
             local at=
             case "$ecosystem" in
               npm_and_yarn) at=$(npm view "$1" time --json 2>/dev/null | jq -r --arg v "$2" '.[$v] // empty') ;;
-              *) at=$(curl -fsS "https://pypi.org/pypi/$1/$2/json" 2>/dev/null | jq -r '[.urls[].upload_time_iso_8601] | min // empty') ;;
+              pip | uv | poetry) at=$(curl -fsS "https://pypi.org/pypi/$1/$2/json" 2>/dev/null | jq -r '[.urls[].upload_time_iso_8601] | min // empty') ;;
+              github_actions)
+                local repo
+                repo=$(cut -d/ -f1-2 <<< "$1")
+                at=$(gh api "repos/$repo/releases/tags/v${2#v}" --jq .published_at 2>/dev/null ||
+                  gh api "repos/$repo/releases/tags/${2#v}" --jq .published_at 2>/dev/null) ;;
             esac
             [ -n "$at" ] && date -d "$at" +%s
           }
 
-          prs=$(gh pr list --state open --limit 100 --json number,author,headRefName \
-            --jq '.[] | select(.author.login == "app/dependabot" or .author.login == "dependabot") | "\(.number) \(.headRefName)"' \
-            | grep -E " $packages" || true)
+          # The packages and versions a commit of Dependabot's updates.
+          updates_in() {
+            gh api "repos/$GH_REPO/commits/$1" --jq .commit.message |
+              awk '/^- dependency-name: /{n=$3} /^  dependency-version: /{print n, $2}'
+          }
+
+          close() {
+            echo "Closing #$1: $2"
+            gh pr close "$1" --delete-branch --comment "Closed by the dependency updates workflow: $2" >/dev/null
+          }
+
+          all=$(gh pr list --state open --limit 100 \
+            --json number,author,headRefName,headRefOid,title,createdAt,baseRefName \
+            --jq "[.[] | select((.author.login == \"app/dependabot\" or .author.login == \"dependabot\")
+                                and (.headRefName | startswith(\"dependabot/\"))
+                                and .baseRefName == \"$DEFAULT_BRANCH\")]")
+
+          # Which group pull request updates each package: "ecosystem name number".
+          grouped=$(jq -r '.[] | select(.title | test(" group")) | "\(.number) \(.headRefOid) \(.headRefName)"' <<< "$all" |
+            while read -r number sha branch; do
+              eco=$(cut -d/ -f2 <<< "$branch")
+              updates_in "$sha" | awk -v e="$eco" -v n="$number" '{print e, $1, n}'
+            done)
+
+          prs=$(jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.headRefOid)\t\(.createdAt)\t\(.title)"' <<< "$all")
           if [ -n "$BRANCH" ]; then
-            prs=$(awk -v b="$BRANCH" '$2 == b' <<< "$prs")
+            prs=$(awk -F'\t' -v b="$BRANCH" '$2 == b' <<< "$prs")
           fi
 
           merged=false
-          now=$(date +%s)
-          while read -r pr branch; do
+          while IFS=$'\t' read -r pr branch sha created title; do
             [ -n "$pr" ] || continue
             ecosystem=$(cut -d/ -f2 <<< "$branch")
-            info=$(gh pr view "$pr" --json headRefOid,title,baseRefName)
-            sha=$(jq -r .headRefOid <<< "$info")
-            title=$(jq -r .title <<< "$info")
-            [ "$(jq -r .baseRefName <<< "$info")" = "$DEFAULT_BRANCH" ] || continue
-
-            for workflow in $CHECK_WORKFLOWS; do
-              if ! passed "$workflow" "$sha"; then
-                echo "#$pr waits: $workflow has not passed on ${sha::7}."
-                continue 2
-              fi
-            done
-
-            # A pull request of its own, outside the groups, is a security fix if
-            # the version it moves away from is vulnerable.
-            security=false
-            if grep -qE -- '-security group' <<< "$title"; then
-              security=true
-            elif ! grep -qE -- ' group' <<< "$title" &&
-                 [[ $title =~ ^(Bump|Update)\ ([^ ]+)\ (requirement\ )?from\ ([^ ]+)\ to ]]; then
+            group=false
+            grep -q ' group' <<< "$title" && group=true
+            name= version=
+            if [ "$group" = false ] &&
+               [[ $title =~ ^(Bump|Update)\ ([^ ]+)\ (requirement\ )?from\ ([^ ]+)\ to ]]; then
               name=${BASH_REMATCH[2]}
               version=$(sed -E 's/^[^0-9]*//' <<< "${BASH_REMATCH[4]}")
-              if vulnerable "$name" "$version"; then
-                security=true
+            fi
+
+            if [ -n "$name" ]; then
+              by=$(awk -v e="$ecosystem" -v n="$name" '$1 == e && $2 == n {print $3; exit}' <<< "$grouped")
+              if [ -n "$by" ]; then
+                close "$pr" "#$by updates $name as well."
+                continue
               fi
             fi
 
+            security=false
+            if grep -qE -- '-security group' <<< "$title"; then
+              security=true
+            elif [ -n "$name" ] && vulnerable "$name" "$version"; then
+              security=true
+            fi
+
+            state=passed
+            for workflow in $CHECK_WORKFLOWS; do
+              result=$(check "$workflow" "$sha")
+              case "$result" in
+                failed) state=failed; failed_workflow=$workflow; break ;;
+                pending | missing) state=$result ;;
+              esac
+            done
+
+            if [ "$state" = failed ]; then
+              if [ "$group" = true ] || [ "$security" = true ]; then
+                echo "#$pr stays open for a person: $failed_workflow failed on ${sha::7}."
+              else
+                close "$pr" "$failed_workflow failed on it, run twice. Dependabot offers the next version of $name when there is one."
+              fi
+              continue
+            fi
+
+            # How long the commit at its head has gone without a result or a merge.
+            pushed=$(gh api "repos/$GH_REPO/commits/$sha" --jq .commit.committer.date)
+            idle=$(( (now - $(date -d "$pushed" +%s)) / 86400 ))
+            if [ "$state" != passed ]; then
+              if [ "$idle" -ge "$STALE_DAYS" ]; then
+                close "$pr" "its checks have had no result for $idle days. Dependabot opens a fresh pull request if the update is still needed."
+              else
+                echo "#$pr waits: the checks are $state on ${sha::7}."
+              fi
+              continue
+            fi
+            if [ "$(gh pr view "$pr" --json mergeable --jq .mergeable)" = CONFLICTING ]; then
+              if [ "$idle" -ge "$STALE_DAYS" ]; then
+                close "$pr" "it has conflicted with $DEFAULT_BRANCH for $idle days. Dependabot opens a fresh pull request if the update is still needed."
+              else
+                echo "#$pr waits: it conflicts with $DEFAULT_BRANCH, which Dependabot resolves."
+              fi
+              continue
+            fi
+
             if [ "$security" = false ]; then
-              # The packages and versions, from Dependabot's commit message.
-              message=$(gh api "repos/$GH_REPO/commits/$sha" --jq .commit.message)
-              updates=$(awk '/^- dependency-name: /{n=$3} /^  dependency-version: /{print n, $2}' <<< "$message")
+              updates=$(updates_in "$sha")
               count=$(grep -c . <<< "$updates" || true)
 
-              oldest=$now
-              while read -r name version; do
-                [ -n "$name" ] || continue
-                at=$(published "$name" "$version") || continue
-                [ "$at" -lt "$oldest" ] && oldest=$at
+              # The oldest publication date found, or when the pull request was
+              # opened if there is none (Docker images, for one).
+              oldest=$(date -d "$created" +%s)
+              found=false
+              while read -r n v; do
+                [ -n "$n" ] || continue
+                at=$(published "$n" "$v") || continue
+                if [ "$found" = false ] || [ "$at" -lt "$oldest" ]; then oldest=$at; fi
+                found=true
               done <<< "$updates"
               days=$(( (now - oldest) / 86400 ))
 
@@ -154,6 +260,17 @@ jobs:
               reason="$count update(s), the oldest out $days day(s)"
             else
               reason="a security fix"
+            fi
+
+            if [ "$ecosystem" = github_actions ]; then
+              if [ -z "$MERGE_TOKEN" ]; then
+                echo "#$pr waits for a person: merging an update of a GitHub Action needs the merge-token secret."
+                continue
+              fi
+              # Merged with a person's token, the push starts the workflows itself.
+              echo "Merging #$pr ($reason): $title"
+              GH_TOKEN=$MERGE_TOKEN gh pr merge "$pr" --squash --delete-branch --match-head-commit "$sha"
+              continue
             fi
 
             echo "Merging #$pr ($reason): $title"
